@@ -1,123 +1,100 @@
-"""Discriminator from StyleGAN. https://github.com/google-research/maskgit/blob/main/maskgit/nets/discriminator.py"""
-
-import functools
-import math
-from typing import Any, Tuple
-import flax.linen as nn
-from flax.linen.initializers import xavier_uniform
 import jax
-from jax import lax
 import jax.numpy as jnp
-import ml_collections
-
-default_kernel_init = xavier_uniform()
-
-def _conv_dimension_numbers(input_shape):
-    """Computes the dimension numbers based on the input shape."""
-    ndim = len(input_shape)
-    lhs_spec = (0, ndim - 1) + tuple(range(1, ndim - 1))
-    rhs_spec = (ndim - 1, ndim - 2) + tuple(range(0, ndim - 2))
-    out_spec = lhs_spec
-    return lax.ConvDimensionNumbers(lhs_spec, rhs_spec, out_spec)
+from flax import linen as nn
+from typing import Any
 
 
-class BlurPool2D(nn.Module):
-    """A layer to do channel-wise blurring + subsampling on 2D inputs.
-
-    Reference:
-    Zhang et al. Making Convolutional Networks Shift-Invariant Again.
-    https://arxiv.org/pdf/1904.11486.pdf.
+def weights_init(module):
     """
-    filter_size: int = 4
-    strides: Tuple[int, int] = (2, 2)
-    padding: str = 'SAME'
+    Initialize weights similarly to PyTorch version.
+    """
+    if isinstance(module, nn.Conv):
+        module.kernel = jax.random.normal(jax.random.PRNGKey(0), module.kernel.shape) * 0.02
+    elif isinstance(module, nn.BatchNorm):
+        module.scale = jax.random.normal(jax.random.PRNGKey(0), module.scale.shape) * 0.02
+        module.bias = jnp.zeros(module.bias.shape)
 
-    def setup(self):
-        if self.filter_size == 3:
-            self.filter = [1., 2., 1.]
-        elif self.filter_size == 4:
-            self.filter = [1., 3., 3., 1.]
-        elif self.filter_size == 5:
-            self.filter = [1., 4., 6., 4., 1.]
-        elif self.filter_size == 6:
-            self.filter = [1., 5., 10., 10., 5., 1.]
-        elif self.filter_size == 7:
-            self.filter = [1., 6., 15., 20., 15., 6., 1.]
+
+class ActNorm(nn.Module):
+    num_features: int
+    logdet: bool = False
+    allow_reverse_init: bool = False
+
+    @nn.compact
+    def __call__(self, x, reverse: bool = False):
+        scale = self.param('scale', nn.initializers.ones, (1, self.num_features, 1, 1))
+        bias = self.param('bias', nn.initializers.zeros, (1, self.num_features, 1, 1))
+
+        if reverse:
+            return (x - bias) / (scale + 1e-6)
         else:
-            raise ValueError('Only filter_size of 3, 4, 5, 6 or 7 is supported.')
+            return scale * x + bias
 
-        self.filter = jnp.array(self.filter, dtype=jnp.float32)
-        self.filter = self.filter[:, None] * self.filter[None, :]
-        with jax.default_matmul_precision('float32'):
-            self.filter /= jnp.sum(self.filter)
-        self.filter = jnp.reshape(
-            self.filter, [self.filter.shape[0], self.filter.shape[1], 1, 1])
+
+class AbstractEncoder(nn.Module):
+    def encode(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+class Labelator(AbstractEncoder):
+    n_classes: int
+    quantize_interface: bool = True
 
     @nn.compact
-    def __call__(self, inputs):
-        channel_num = inputs.shape[-1]
-        dimension_numbers = _conv_dimension_numbers(inputs.shape)
-        depthwise_filter = jnp.tile(self.filter, [1, 1, 1, channel_num])
-        with jax.default_matmul_precision('float32'):
-            outputs = lax.conv_general_dilated(inputs, depthwise_filter, self.strides,
-                self.padding, feature_group_count=channel_num, dimension_numbers=dimension_numbers)
-        return outputs
+    def __call__(self, c):
+        c = jnp.expand_dims(c, axis=-1)
+        if self.quantize_interface:
+            return c, None, [None, None, c.astype(jnp.int32)]
+        return c
 
-class ResBlock(nn.Module):
-    """StyleGAN ResBlock for D.
 
-    https://github.com/rosinality/stylegan2-pytorch/blob/master/model.py#L618
-    """
-    filters: int
-    activation_fn: Any
+class SOSProvider(AbstractEncoder):
+    sos_token: int
+    quantize_interface: bool = True
 
     @nn.compact
     def __call__(self, x):
-        input_dim = x.shape[-1]
-        residual = x
-        x = nn.Conv(input_dim, (3, 3), kernel_init=default_kernel_init)(x)
-        x = self.activation_fn(x)
-        x = BlurPool2D(filter_size=4)(x)
-        residual = BlurPool2D(filter_size=4)(residual)
-        residual = nn.Conv(self.filters, (1, 1), use_bias=False, kernel_init=default_kernel_init)(residual)
-        x = nn.Conv(self.filters, (3, 3), kernel_init=default_kernel_init)(x)
-        x = self.activation_fn(x)
-        out = (residual + x) / math.sqrt(2)
-        return out
+        c = jnp.ones((x.shape[0], 1)) * self.sos_token
+        c = c.astype(jnp.int32)
+        if self.quantize_interface:
+            return c, None, [None, None, c]
+        return c
 
 
-class Discriminator(nn.Module):
-    """StyleGAN Discriminator."""
-    config: ml_collections.ConfigDict
-
-    def setup(self):
-        self.input_size = self.config.image_size
-        self.activation_fn = functools.partial(jax.nn.leaky_relu, negative_slope=0.2)
-        self.channel_multiplier = 1
+class NLayerDiscriminator(nn.Module):
+    input_nc: int = 3
+    ndf: int = 64
+    n_layers: int = 3
+    use_actnorm: bool = False
 
     @nn.compact
     def __call__(self, x):
-        filters = {
-            4: 512,
-            8: 512,
-            16: 512,
-            32: 512,
-            64: 256 * self.channel_multiplier,
-            128: 128 * self.channel_multiplier,
-            256: 64 * self.channel_multiplier,
-            512: 32 * self.channel_multiplier,
-            1024: 16 * self.channel_multiplier,
-        }
-        x = nn.Conv(filters[self.input_size], (3, 3), kernel_init=default_kernel_init)(x)
-        x = self.activation_fn(x)
-        log_size = int(math.log2(self.input_size))
-        for i in range(log_size, 2, -1):
-            x = ResBlock(filters[2**(i - 1)], self.activation_fn)(x)
-            print("Disc shape", x.shape)
-        x = nn.Conv(filters[4], (3, 3), kernel_init=default_kernel_init)(x)
-        x = self.activation_fn(x)
-        x = x.reshape((x.shape[0], -1))
-        x = nn.Dense(filters[4], kernel_init=default_kernel_init)(x)
-        x = self.activation_fn(x)
-        x = nn.Dense(1, kernel_init=default_kernel_init)(x)
+        norm_layer = ActNorm if self.use_actnorm else nn.BatchNorm
+
+        kw = 4
+        padw = 1
+
+        # First layer
+        x = nn.Conv(features=self.ndf, kernel_size=(kw, kw), strides=(2, 2), padding=((padw, padw), (padw, padw)))(x)
+        x = nn.leaky_relu(x, negative_slope=0.2)
+
+        # Hidden layers
+        nf_mult = 1
+        nf_mult_prev = 1
+        for n in range(1, self.n_layers):
+            nf_mult_prev = nf_mult
+            nf_mult = min(2 ** n, 8)
+            x = nn.Conv(features=self.ndf * nf_mult, kernel_size=(kw, kw), strides=(2, 2), padding=((padw, padw), (padw, padw)))(x)
+            x = norm_layer(num_features=self.ndf * nf_mult)(x)
+            x = nn.leaky_relu(x, negative_slope=0.2)
+
+        # Final hidden layer
+        nf_mult_prev = nf_mult
+        nf_mult = min(2 ** self.n_layers, 8)
+        x = nn.Conv(features=self.ndf * nf_mult, kernel_size=(kw, kw), strides=(1, 1), padding=((padw, padw), (padw, padw)))(x)
+        x = norm_layer(num_features=self.ndf * nf_mult)(x)
+        x = nn.leaky_relu(x, negative_slope=0.2)
+
+        # Output layer
+        x = nn.Conv(features=1, kernel_size=(kw, kw), strides=(1, 1), padding=((padw, padw), (padw, padw)))(x)
         return x
