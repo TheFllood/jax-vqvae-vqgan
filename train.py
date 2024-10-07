@@ -3,7 +3,7 @@ try: # For debugging
     enable_debug()
 except ImportError:
     pass
-
+import yaml
 import flax.linen as nn
 import jax.numpy as jnp
 from absl import app, flags
@@ -15,8 +15,8 @@ import jax.numpy as jnp
 import flax
 import optax
 import wandb
-from ml_collections import config_flags
 import ml_collections
+from ml_collections import config_flags
 import tensorflow_datasets as tfds
 import tensorflow as tf
 tf.config.set_visible_devices([], "GPU")
@@ -30,60 +30,34 @@ from utils.train_state import TrainState, target_update
 from utils.checkpoint import Checkpoint
 from utils.pretrained_resnet import get_pretrained_embs, get_pretrained_model
 from utils.fid import get_fid_network, fid_from_stats
-from models.vqvae import VQVAE
-from models.discriminator import Discriminator
+
+from models.sd_vae import AutoencoderKL
+from models.discriminator import NLayerDiscriminator
+from models.lpips import LPIPS
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('dataset_name', 'imagenet256', 'Environment name.')
+flags.DEFINE_string('config', 'autoencoder_kl_16x16x16.yaml', 'Config name.')
 flags.DEFINE_string('save_dir', None, 'Save dir (if not None, save params).')
 flags.DEFINE_string('load_dir', None, 'Load dir (if not None, load params from here).')
 flags.DEFINE_integer('seed', np.random.choice(1000000), 'Random seed.')
 flags.DEFINE_integer('log_interval', 1000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 20000, 'Eval interval.')
-flags.DEFINE_integer('save_interval', 200000, 'Eval interval.')
+flags.DEFINE_integer('save_interval', 200000, 'Save interval.')
 flags.DEFINE_integer('batch_size', 256, 'Total Batch size.')
 flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
 
-model_config = ml_collections.ConfigDict({
-    # VQVAE
-    'lr': 0.0001,
-    'beta1': 0.0,
-    'beta2': 0.99,
-    'lr_warmup_steps': 2000,
-    'lr_decay_steps': 98_000,
-    'filters': 128,
-    'num_res_blocks': 2,
-    'channel_multipliers': (1, 1, 2, 2, 4),
-    'embedding_dim': 256, # For FSQ, a good default is 4.
-    'norm_type': 'GN',
-    'weight_decay': 0.05,
-    'clip_gradient': 1.0,
-    'l2_loss_weight': 1.0,
-    'eps_update_rate': 0.9999,
-    # Quantizer
-    'quantizer_type': 'vq', # or 'fsq', 'kl'
-    # Quantizer (VQ)
-    'quantizer_loss_ratio': 1,
-    'codebook_size': 1024,
-    'entropy_loss_ratio': 0.1,
-    'entropy_loss_type': 'softmax',
-    'entropy_temperature': 0.01,
-    'commitment_cost': 0.25,
-    # Quantizer (FSQ)
-    'fsq_levels': 5, # Bins per dimension.
-    # Quantizer (KL)
-    'kl_weight': 0.001,
-    # GAN
-    'g_adversarial_loss_weight': 0.1,
-    'g_grad_penalty_cost': 10,
-    'perceptual_loss_weight': 0.1,
-    'gan_warmup_steps': 10000,
-})
+print("load model config {config}")
+
+with open('config/{config}', 'r') as f:
+    config_dict = yaml.load(f, Loader=yaml.FullLoader)
+
+model_config = ml_collections.ConfigDict(config_dict)
 
 wandb_config = default_wandb_config()
 wandb_config.update({
-    'project': 'vqvae',
-    'name': 'vqvae_{dataset_name}',
+    'project': 'vae',
+    'name': 'vae_{config}_{dataset_name}',
 })
 
 config_flags.DEFINE_config_dict('wandb', wandb_config, lock_config=False)
@@ -103,11 +77,11 @@ def sigmoid_cross_entropy_with_logits(*, labels: jnp.ndarray, logits: jnp.ndarra
     neg_abs_logits = jnp.where(condition, -logits, logits)
     return relu_logits - logits * labels + jnp.log1p(jnp.exp(neg_abs_logits))
 
-class VQGANModel(flax.struct.PyTreeNode):
+class TrainModel(flax.struct.PyTreeNode):
     rng: Any
     config: dict = flax.struct.field(pytree_node=False)
-    vqvae: TrainState
-    vqvae_eps: TrainState
+    vae: TrainState
+    vae_eps: TrainState
     discriminator: TrainState
 
     # Train G and D.
@@ -115,7 +89,7 @@ class VQGANModel(flax.struct.PyTreeNode):
     def update(self, images, pmap_axis='data'):
         new_rng, curr_key = jax.random.split(self.rng, 2)
 
-        resnet, resnet_params = get_pretrained_model('resnet50', 'data/resnet_pretrained.npy')
+        resnet, resnet_params = LPIPS()
 
         is_gan_training = 1.0 - (self.vqvae.step < self.config['gan_warmup_steps']).astype(jnp.float32)
 
@@ -207,6 +181,9 @@ class VQGANModel(flax.struct.PyTreeNode):
 ## Training Code.
 ##############################################
 def main(_):
+    import pdb
+    pdb.set_trace()
+    
     np.random.seed(FLAGS.seed)
     print("Using devices", jax.local_devices())
     device_count = len(jax.local_devices())
