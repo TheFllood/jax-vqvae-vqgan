@@ -47,21 +47,7 @@ flags.DEFINE_integer('save_interval', 200000, 'Save interval.')
 flags.DEFINE_integer('batch_size', 256, 'Total Batch size.')
 flags.DEFINE_integer('max_steps', int(1_000_000), 'Number of training steps.')
 
-print("load model config {config}")
 
-with open('config/{config}', 'r') as f:
-    config_dict = yaml.load(f, Loader=yaml.FullLoader)
-
-model_config = ml_collections.ConfigDict(config_dict)
-
-wandb_config = default_wandb_config()
-wandb_config.update({
-    'project': 'vae',
-    'name': 'vae_{config}_{dataset_name}',
-})
-
-config_flags.DEFINE_config_dict('wandb', wandb_config, lock_config=False)
-config_flags.DEFINE_config_dict('model', model_config, lock_config=False)
 
 ##############################################
 ## Model Definitions.
@@ -183,7 +169,21 @@ class TrainModel(flax.struct.PyTreeNode):
 def main(_):
     import pdb
     pdb.set_trace()
-    
+    print("load model config {config}")
+
+    with open('config/{config}', 'r') as f:
+        config_dict = yaml.load(f, Loader=yaml.FullLoader)
+
+    model_config = ml_collections.ConfigDict(config_dict)
+
+    wandb_config = default_wandb_config()
+    wandb_config.update({
+        'project': 'vae',
+        'name': 'vae_{config}_{dataset_name}',
+    })
+
+    config_flags.DEFINE_config_dict('wandb', wandb_config, lock_config=False)
+    config_flags.DEFINE_config_dict('model', model_config, lock_config=False)
     np.random.seed(FLAGS.seed)
     print("Using devices", jax.local_devices())
     device_count = len(jax.local_devices())
